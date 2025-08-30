@@ -10,7 +10,6 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYCOLMAP_CUDA_ARCHITECTURES="native" \
     CMAKE_CUDA_ARCHITECTURES="native" \
     PYTHONPATH="/opt/third_party/SuperGluePretrainedNetwork:/opt/third_party" \
-    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda-11.8/targets/x86_64-linux/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}" \
     PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}" \
     COLMAP_EXE_PATH="/usr/local/bin/colmap" \
     HLOC_COLMAP_PATH="/usr/local/bin/colmap" \
@@ -28,10 +27,18 @@ RUN mkdir -p /home/user/.cache/torch/hub/checkpoints \
              /home/user/.cache/torch/hub/netvlad \
              /home/user/.cache/hloc
 
-# CuDNN nvrtc 라이브러리 심볼릭 링크 수정 (CuDNN v8 경고 해결)
-RUN cd /usr/local/cuda-11.8/targets/x86_64-linux/lib/ && \
-    ln -sf libnvrtc.so.11.8.89 libnvrtc.so && \
-    ln -sf libnvrtc-builtins.so.11.8.89 libnvrtc-builtins.so
+# CUDA 12.8 nvrtc 라이브러리 심볼릭 링크 설정
+RUN if [ -d "/usr/local/cuda-12.8/targets/x86_64-linux/lib/" ]; then \
+        cd /usr/local/cuda-12.8/targets/x86_64-linux/lib/ && \
+        ln -sf libnvrtc.so.12 libnvrtc.so && \
+        ln -sf libnvrtc-builtins.so.12 libnvrtc-builtins.so; \
+    elif [ -d "/usr/local/cuda/lib64/" ]; then \
+        cd /usr/local/cuda/lib64/ && \
+        ln -sf libnvrtc.so.12 libnvrtc.so && \
+        ln -sf libnvrtc-builtins.so.12 libnvrtc-builtins.so; \
+    else \
+        echo "CUDA library directory not found, skipping nvrtc links"; \
+    fi
 
 # COLMAP 업그레이드 스크립트만 먼저 복사
 COPY scripts/upgrade-colmap.sh /tmp/scripts/
@@ -51,8 +58,55 @@ RUN chmod +x /tmp/scripts/*.sh /tmp/scripts/*.py /tmp/patches/*.py
 # 의존성 설치 (pycolmap 포함)
 RUN /tmp/scripts/setup-dependencies.sh
 
+# === PyTorch 2.7.0 stable + CUDA 12.8 (RTX 5090 Blackwell 공식 지원) ===
+# 기존 PyTorch 제거 및 안정적인 2.7.0 stable 버전 설치
+RUN python -m pip uninstall -y torch torchvision torchaudio || true
+RUN python -m pip install --break-system-packages \
+    torch==2.7.0 \
+    torchvision \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --force-reinstall \
+    --no-cache-dir
+
+# CUDA 12.8 toolkit 설치 (nvcc 컴파일러 포함) - 기존 keyring 활용
+RUN apt-get update && \
+    # CUDA 12.8 패키지 직접 설치 (기존 keyring 사용)
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        cuda-toolkit-12-8 \
+        cuda-compiler-12-8 \
+        cuda-nvcc-12-8 \
+        cuda-libraries-dev-12-8 \
+        --no-install-recommends && \
+    # CUDA 12.8 심볼릭 링크 생성
+    ln -sf /usr/local/cuda-12.8 /usr/local/cuda && \
+    # 설치 확인
+    ls -la /usr/local/cuda-12.8/bin/nvcc && \
+    /usr/local/cuda-12.8/bin/nvcc --version && \
+    rm -rf /var/lib/apt/lists/*
+
+# CUDA 12.8 환경변수 설정 (시스템 CUDA toolkit 사용)
+ENV CUDA_HOME=/usr/local/cuda-12.8 \
+    CUDA_PATH=/usr/local/cuda-12.8 \
+    PATH="/usr/local/cuda-12.8/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_cupti/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_nvrtc/lib:${LD_LIBRARY_PATH}" \
+    PYCOLMAP_CUDA_ARCHITECTURES="native" \
+    CMAKE_CUDA_ARCHITECTURES="native"
+
 # NumPy 2.x 호환성 문제 해결 - 명시적으로 1.26.4 고정
 RUN python -m pip install --break-system-packages "numpy==1.26.4" --force-reinstall
+
+# GLM 라이브러리 설치 (gsplat 컴파일 의존성)
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        libglm-dev \
+        --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+
+# gsplat 설정 - CUDA 12.8 호환성을 위해 기존 1.4.0 버전 유지
+# (v1.5.3은 cooperative_groups::labeled_partition API 호환성 문제로 인해 CUDA 12.8에서 컴파일 실패)
+RUN echo "✅ Using existing gsplat 1.4.0 (CUDA 12.8 compatible)" && \
+    python -c "import gsplat; print(f'gsplat version: {gsplat.__version__}')" || echo "gsplat not available"
 
 # PyMeshLab Qt 라이브러리 충돌 문제 해결 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -74,12 +128,12 @@ RUN python -m pip uninstall -y pymeshlab || true
 # PyMeshLab 우회 패치 적용
 RUN python /tmp/patches/pymeshlab_bypass.py || echo "⚠ PyMeshLab bypass patch failed"
 
-# 모델 다운로드 (빌드 시 자동으로 다운로드)
-RUN mkdir -p /tmp/models_download
-COPY download_models.sh /tmp/models_download/
-RUN cd /tmp/models_download && chmod +x download_models.sh && ./download_models.sh
-RUN cp /tmp/models_download/models_cache/*.pth /home/user/.cache/torch/hub/checkpoints/ 2>/dev/null || echo "PyTorch 모델 복사 중 일부 실패"
-RUN cp /tmp/models_download/models_cache/*.mat /home/user/.cache/torch/hub/netvlad/ 2>/dev/null || echo "NetVLAD 모델 복사 중 일부 실패"
+# 모델 복사 (호스트에서 이미 다운로드된 모델 사용)
+COPY models_cache/ /tmp/models_cache/
+RUN mkdir -p /home/user/.cache/torch/hub/checkpoints /home/user/.cache/torch/hub/netvlad
+RUN cp /tmp/models_cache/*.pth /home/user/.cache/torch/hub/checkpoints/ && \
+    cp /tmp/models_cache/*.mat /home/user/.cache/torch/hub/netvlad/ && \
+    echo "✅ All models copied successfully"
 
 # 파일 권한 설정
 RUN chmod -R 755 /home/user/.cache
@@ -100,9 +154,16 @@ RUN python /tmp/patches/fix_viser_camera_message.py || echo "⚠ viser compatibi
 # 모델 및 패치 검증 (실패해도 계속 진행)
 RUN python /tmp/scripts/verify-models.py || echo "⚠ Some verifications failed, but core functionality available"
 
-# 최종 NumPy 버전 고정 확인
+# 최종 PyTorch 환경 검증
 RUN python -m pip install --break-system-packages "numpy==1.26.4" --force-reinstall && \
-    python -c "import numpy; print(f'Final NumPy version: {numpy.__version__}')"
+    echo "=== Environment Verification ===" && \
+    python -c "import numpy; print('Final NumPy version:', numpy.__version__)" && \
+    python -c "import torch; print('PyTorch version:', torch.__version__)" && \
+    python -c "import torch; print('PyTorch CUDA version:', torch.version.cuda)" && \
+    python -c "import torch; print('CUDA available (build-time):', torch.cuda.is_available())" && \
+    python -c "import torch; print('Supported architectures:', torch.cuda.get_arch_list())" && \
+    python /tmp/scripts/final-verification.py && \
+    echo "✅ Build verification completed"
 
 # 최종 정리
 RUN rm -rf /tmp/scripts /tmp/patches

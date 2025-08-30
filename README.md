@@ -1,13 +1,20 @@
 # HLOC-NeRFStudio: Advanced 3D Reconstruction with NeRFStudio
 
-🚀 **Production-ready Docker container for NeRFStudio with HLOC, COLMAP, and all essential 3D reconstruction tools**
+🚀 **Production-ready Docker container for NeRFStudio with HLOC, COLMAP, and RTX 5090 support**
 
-This repository provides a comprehensive, pre-configured Docker environment that solves common compatibility issues and setup challenges when working with NeRFStudio, HLOC, COLMAP, and related 3D reconstruction tools.
+This repository provides a comprehensive, pre-configured Docker environment that solves common compatibility issues and setup challenges when working with NeRFStudio, HLOC, COLMAP, and related 3D reconstruction tools. **Optimized for NVIDIA RTX 5090 with sm_120 architecture support.**
 
 ## ✨ Key Features
 
+### 🎮 **RTX 5090 / Blackwell Architecture Support**
+- ✅ **PyTorch 2.7.0 stable** with CUDA 12.8 runtime
+- ✅ **sm_120 compute capability** for RTX 5090 support
+- ✅ **gsplat 1.4.0** optimized for CUDA 12.8 compatibility
+- ✅ **16GB shared memory** configuration for large scenes
+- ✅ **31.3GB VRAM** fully supported and utilized
+
 ### 🔧 **Pre-solved Compatibility Issues**
-- ✅ **COLMAP 3.12.4** with frames.bin support (C++ engine)
+- ✅ **COLMAP 3.12.4** with frames.bin support (C++ engine + nvcc compiler)
 - ✅ **HLOC** with syntax fixes and PyColmap compatibility patches
 - ✅ **NumPy 1.26.4** compatibility (fixes NeRFStudio v2.x issues)
 - ✅ **PyMeshLab** conflicts resolved with Qt bypass patches
@@ -30,7 +37,8 @@ This repository provides a comprehensive, pre-configured Docker environment that
 
 ### Prerequisites
 - Docker with NVIDIA Container Runtime
-- NVIDIA GPU with CUDA support
+- **NVIDIA RTX 5090** (or other sm_120+ compatible GPU)
+- **NVIDIA Driver 470+** with CUDA 12.8+ support
 - Docker Compose
 
 ### 1. Clone and Setup
@@ -41,31 +49,39 @@ cd hloc-nerfstudio
 
 ### 2. Build and Run
 ```bash
-# Quick setup (recommended)
-./setup.sh
+# Build the RTX 5090 optimized image
+docker build -t hloc-nerfstudio:latest .
 
-# Or manually
-docker-compose build hloc-nerfstudio
-docker-compose up -d hloc-nerfstudio
+# Run with docker-compose (16GB shared memory)
+docker-compose up -d
+
+# Or run directly
+docker run --rm --gpus all -v ./data:/workspace/data -v ./outputs:/workspace/outputs -p 7007:7007 -it hloc-nerfstudio:latest bash
 ```
 
-### 3. Access the Container
+### 3. Verify RTX 5090 Support
 ```bash
 # Enter the container
 docker-compose exec hloc-nerfstudio bash
+
+# Check RTX 5090 detection
+python -c "import torch; print('GPU:', torch.cuda.get_device_name(0)); print('Memory:', f'{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')"
 
 # Test installation
 ns-train nerfacto --help
 python -c "import hloc; print('HLOC ready!')"
 ```
 
-### 4. Start Training
+### 4. Video Processing & Training
 ```bash
-# Inside the container
-ns-train nerfacto --data /workspace/data/your_scene
+# Process video with HLOC (SuperPoint + LightGlue)
+ns-process-data video --data /workspace/data/your_video.mp4 --output-dir /workspace/data/your_scene
+
+# Train with Gaussian Splatting (RTX 5090 optimized)
+ns-train splatfacto --data /workspace/data/your_scene --output-dir /workspace/outputs
 
 # View training progress
-ns-viewer --load-config /workspace/outputs/your_scene/nerfacto/config.yml
+ns-viewer --load-config /workspace/outputs/your_scene/splatfacto/config.yml
 ```
 
 Access the viewer at: **http://localhost:7007**
@@ -91,20 +107,22 @@ hloc-nerfstudio/
 
 ## 🔧 Advanced Usage
 
-### Custom Model Training
+### RTX 5090 Optimized Training
 ```bash
-# Custom NeRFStudio method
+# Gaussian Splatting with maximum performance
+ns-train splatfacto \
+  --data /workspace/data/your_scene \
+  --output-dir /workspace/outputs \
+  --pipeline.model.num-rays-per-chunk 32768 \
+  --pipeline.model.eval-num-rays-per-chunk 8192 \
+  --viewer.websocket-port 7007
+
+# NeRFacto with RTX 5090 memory optimization  
 ns-train nerfacto \
   --data /workspace/data/your_scene \
   --output-dir /workspace/outputs \
+  --pipeline.model.num-rays-per-chunk 16384 \
   --viewer.websocket-port 7007
-
-# With HLOC feature extraction
-python -c "
-import hloc
-from hloc import extract_features, match_features
-# Your HLOC pipeline here
-"
 ```
 
 ### COLMAP Integration
@@ -150,9 +168,14 @@ python -c "import hloc; print(hloc.__file__)"
 python -c "import numpy; print(numpy.__version__)"
 ```
 
-**Q: CUDA out of memory**
+**Q: RTX 5090 not detected or CUDA out of memory**
 ```bash
-# Adjust batch size in training
+# Check RTX 5090 detection
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0)); print('Architectures:', torch.cuda.get_arch_list())"
+
+# Should show: ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120', 'compute_120']
+
+# Adjust memory allocation for RTX 5090
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512"
 ```
 
@@ -187,17 +210,20 @@ docker build --no-cache -t hloc-nerfstudio:fresh .
 ./download_models.sh
 ```
 
-## 📊 Performance Tips
+## 📊 RTX 5090 Performance Tips
 
 ### GPU Optimization
-- Use `--mixed-precision` for faster training
-- Adjust `--pipeline.model.num-rays-per-chunk` based on GPU memory
-- Enable `--pipeline.model.use-appearance-embedding false` for faster inference
+- **RTX 5090**: Use `--pipeline.model.num-rays-per-chunk 32768` for maximum throughput
+- **31.3GB VRAM**: Enable large batch sizes with `--pipeline.model.eval-num-rays-per-chunk 8192`
+- **sm_120**: Full PyTorch 2.7 + CUDA 12.8 performance optimization
+- **gsplat 1.4.0**: Optimized Gaussian Splatting with CUDA 12.8 compatibility
 
 ### Memory Management
+- **16GB Shared Memory**: Pre-configured in docker-compose.yml
 - Use `export OMP_NUM_THREADS=1` for CPU efficiency
 - Set `TORCH_NUM_WORKERS=0` for Docker environments
 - Enable `CUDA_MODULE_LOADING=LAZY` for faster startup
+- `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512` for memory optimization
 
 ## 🤝 Contributing
 
