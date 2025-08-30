@@ -1,0 +1,63 @@
+FROM ghcr.io/nerfstudio-project/nerfstudio:latest
+
+# 환경변수 설정
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DEFAULT_TIMEOUT=120 \
+    TORCH_HOME=/home/user/.cache/torch \
+    HF_HOME=/home/user/.cache/huggingface \
+    HLOC_CACHE=/home/user/.cache/hloc \
+    PYCOLMAP_CUDA_ARCHITECTURES="native" \
+    CMAKE_CUDA_ARCHITECTURES="native" \
+    PYTHONPATH="/opt/third_party/SuperGluePretrainedNetwork:/opt/third_party" \
+    LD_LIBRARY_PATH="/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}" \
+    COLMAP_EXE_PATH="/usr/local/bin/colmap" \
+    HLOC_COLMAP_PATH="/usr/local/bin/colmap" \
+    HLOC_USE_PYCOLMAP="false" \
+    OMP_NUM_THREADS=1 \
+    PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512" \
+    TORCH_NUM_WORKERS=0
+
+# 필요한 디렉터리 생성
+RUN mkdir -p /home/user/.cache/torch/hub/checkpoints \
+             /home/user/.cache/torch/hub/netvlad \
+             /home/user/.cache/hloc
+
+# 스크립트와 패치 파일들 복사
+COPY services/nerfstudio/scripts/ /tmp/scripts/
+COPY services/nerfstudio/patches/ /tmp/patches/
+RUN chmod +x /tmp/scripts/*.sh /tmp/scripts/*.py /tmp/patches/*.py
+
+# COLMAP 업그레이드 (frames.bin 지원을 위해 3.12+로)
+RUN /tmp/scripts/upgrade-colmap.sh
+
+# 의존성 설치 (최신 pycolmap 포함)
+RUN /tmp/scripts/setup-dependencies.sh
+
+# 사전 다운로드된 모델 파일들 복사
+COPY services/nerfstudio/models_cache/superpoint_lightglue.pth /home/user/.cache/torch/hub/checkpoints/
+COPY services/nerfstudio/models_cache/disk_lightglue.pth /home/user/.cache/torch/hub/checkpoints/
+COPY services/nerfstudio/models_cache/aliked_lightglue.pth /home/user/.cache/torch/hub/checkpoints/
+COPY services/nerfstudio/models_cache/sift_lightglue.pth /home/user/.cache/torch/hub/checkpoints/
+COPY services/nerfstudio/models_cache/superpoint_v1.pth /home/user/.cache/torch/hub/checkpoints/
+COPY services/nerfstudio/models_cache/VGG16-NetVLAD-Pitts30K.mat /home/user/.cache/torch/hub/netvlad/
+COPY services/nerfstudio/models_cache/VGG16-NetVLAD-TokyoTM.mat /home/user/.cache/torch/hub/netvlad/
+
+# 파일 권한 설정
+RUN chmod -R 755 /home/user/.cache
+
+# 호환성 패치 적용
+RUN python /tmp/scripts/apply-patches.py
+
+# 모델 및 패치 검증
+RUN python /tmp/scripts/verify-models.py
+
+# 최종 정리
+RUN rm -rf /tmp/scripts /tmp/patches
+
+# 작업 디렉터리 설정
+WORKDIR /workspace
+
+# 헬스체크
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD nvidia-smi || exit 1

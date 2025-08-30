@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  hloc-nerfstudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hloc-nerfstudio
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./data:/workspace/data:rw
+      - ./outputs:/workspace/outputs:rw
+      - ./models:/workspace/models:rw
+    ports:
+      - "7007:7007"
+    stdin_open: true
+    tty: true
+    shm_size: '2gb'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

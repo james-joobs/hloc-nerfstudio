@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# NeRFStudio and HLOC specific
+data/
+outputs/
+models/
+models_cache/
+*.pth
+*.mat
+*.bin
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.cache/

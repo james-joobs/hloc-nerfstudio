@@ -1,0 +1,642 @@
+FROM ghcr.io/nerfstudio-project/nerfstudio:latest
+
+# (선택) 한국 미러: 베이스 이미지가 Debian/Ubuntu 어느 쪽인지에 따라 일부만 적용될 수 있음
+RUN sed -i 's|http://deb.debian.org|http://ftp.kaist.ac.kr|g' /etc/apt/sources.list* 2>/dev/null || true && \
+    sed -i 's|http://security.debian.org|http://ftp.kaist.ac.kr|g' /etc/apt/sources.list* 2>/dev/null || true && \
+    sed -i 's|http://archive.ubuntu.com|http://mirror.kakao.com|g' /etc/apt/sources.list* 2>/dev/null || true
+
+# 네트워크/권한/캐시: pip 캐시 끄고, PyTorch/모델 캐시 경로 통일
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DEFAULT_TIMEOUT=120 \
+    TORCH_HOME=/home/user/.cache/torch \
+    HF_HOME=/home/user/.cache/huggingface \
+    HLOC_CACHE=/home/user/.cache/hloc \
+    PYCOLMAP_CUDA_ARCHITECTURES="native" \
+    CMAKE_CUDA_ARCHITECTURES="native"
+
+# SuperGluePretrainedNetwork 경로를 PYTHONPATH에 추가
+ENV PYTHONPATH="/opt/third_party/SuperGluePretrainedNetwork:/opt/third_party"
+
+# pycolmap C++ backend를 위한 필수 의존성 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git vim ca-certificates libgl1 libglib2.0-0 \
+      build-essential cmake \
+      libboost-program-options-dev libboost-filesystem-dev libboost-graph-dev \
+      libboost-system-dev libboost-test-dev \
+      libeigen3-dev libflann-dev libfreeimage-dev \
+      libmetis-dev libgoogle-glog-dev libgtest-dev \
+      libsqlite3-dev libglew-dev qtbase5-dev libqt5opengl5-dev \
+      libcgal-dev libceres-dev && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# pip 최신화
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# pycolmap 문제 해결을 위한 환경 설정
+# LD_LIBRARY_PATH 설정으로 C++ 라이브러리 경로 보장
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+
+
+# hloc + lightglue + 유틸 설치
+# - hloc는 git에서 설치 (버전 핀 안정화 원하면 특정 커밋으로 고정 가능)
+# - pycolmap 의존성 무시하고 설치
+RUN python -m pip install --break-system-packages \
+      --no-deps "git+https://github.com/cvg/Hierarchical-Localization.git" && \
+    python -m pip install --break-system-packages \
+      lightglue \
+      kornia \
+      pydegensac \
+      opencv-python-headless \
+      faiss-cpu \
+      h5py \
+      scipy \
+      tqdm
+
+# Magicleap SuperPoint 구현체는 pip 패키지가 아니므로 clone 후 PYTHONPATH로 노출
+RUN mkdir -p /opt/third_party && \
+    git clone --depth=1 https://github.com/magicleap/SuperGluePretrainedNetwork.git \
+      /opt/third_party/SuperGluePretrainedNetwork
+
+# 간단한 헬스체크: 모듈 import 확인 (실패해도 빌드 중단시키지 않음)
+RUN python - <<'PY' || true
+import importlib
+mods = [
+  "hloc",
+  "lightglue",
+  "kornia",
+  "SuperGluePretrainedNetwork.models.superpoint",
+]
+for m in mods:
+    print(m, "OK" if importlib.util.find_spec(m) else "MISSING")
+PY
+
+# COLMAP 바이너리 확인 및 pycolmap fallback 설정
+RUN which colmap && echo "COLMAP binary found at: $(which colmap)" && colmap -h | head -3 || \
+    echo "WARNING: COLMAP binary not found"
+
+
+# hloc가 COLMAP 바이너리를 사용하도록 환경변수 설정
+ENV COLMAP_EXE_PATH="/usr/local/bin/colmap" \
+    HLOC_COLMAP_PATH="/usr/local/bin/colmap" \
+    HLOC_USE_PYCOLMAP="false"
+
+# 🔧 pycolmap 설치 - 원래 버전 (C++ 백엔드 문제 방지)
+RUN echo "=== Installing pycolmap ===" && \
+    # 필수 의존성 설치
+    python -m pip install --break-system-packages numpy pybind11 wheel setuptools && \
+    # pycolmap 원래 버전 설치
+    python -m pip install --break-system-packages pycolmap --verbose && \
+    # 설치 확인
+    python -c "import pycolmap; print(f'✓ pycolmap {pycolmap.__version__} installed')" && \
+    # C++ backend 테스트
+    python -c "import pycolmap._core; print('✓ pycolmap._core available')" || \
+    echo "⚠ pycolmap._core not available but pycolmap installed"
+
+# 접근법 2: hloc 네트워크 다운로드 방지 패치
+RUN python - <<'EOF' || true
+import os
+import sys
+
+# hloc netvlad.py 패치 - 이미 다운로드된 파일이 있으면 다운로드 건너뛰기
+try:
+    import hloc
+    hloc_path = hloc.__file__.replace('__init__.py', '')
+    
+    # netvlad.py 파일 패치
+    netvlad_file = os.path.join(hloc_path, 'extractors', 'netvlad.py')
+    if os.path.exists(netvlad_file):
+        with open(netvlad_file, 'r') as f:
+            content = f.read()
+        
+        if 'torch.hub.download_url_to_file(url, checkpoint_path)' in content and 'DOWNLOAD_SKIP_PATCH' not in content:
+            # 이미 if not checkpoint_path.exists() 블록이 있는 경우 그 안의 다운로드 코드를 수정
+            import re
+            
+            # 안전한 최소 패치: 단순히 다운로드 체크만 수정
+            import re
+            
+            # 1. 첫 번째 시도: if not checkpoint_path.exists() 블록 내부에서만 다운로드 코드 수정
+            download_pattern = r'(\s+)(torch\.hub\.download_url_to_file\(url, checkpoint_path\))'
+            replacement = r'\1# \2  # DOWNLOAD_SKIP_PATCH\n\1print(f"ERROR: Model not found at {checkpoint_path}")\n\1print(f"Model should have been pre-downloaded during build.")\n\1url = self.checkpoint_urls[conf["model_name"]]\n\1print(f"Expected URL: {url}")\n\1raise FileNotFoundError(f"Missing NetVLAD model: {checkpoint_path.name}")'
+            
+            patched_content = re.sub(download_pattern, replacement, content)
+            
+            # 2. 만약 위 패치가 작동하지 않았다면 단순 교체
+            if patched_content == content:
+                patched_content = content.replace(
+                    'torch.hub.download_url_to_file(url, checkpoint_path)',
+                    '''# torch.hub.download_url_to_file(url, checkpoint_path)  # DOWNLOAD_SKIP_PATCH
+                print(f"ERROR: Model not found at {checkpoint_path}")
+                raise FileNotFoundError(f"Missing NetVLAD model: {checkpoint_path.name}")'''
+                )
+            
+            # 패치 표시 추가
+            patched_content = '# DOWNLOAD_SKIP_PATCH APPLIED\n' + patched_content
+            
+            with open(netvlad_file, 'w') as f:
+                f.write(patched_content)
+            print("✓ Applied NetVLAD download skip patch to hloc")
+            print(f"  Patched file: {netvlad_file}")
+    
+    # hloc utils에 pycolmap 우회 패치 추가
+    patch_file = os.path.join(hloc_path, 'utils', 'parsers.py')
+    if os.path.exists(patch_file):
+        with open(patch_file, 'r') as f:
+            content = f.read()
+        
+        if 'import pycolmap' in content and 'COLMAP_FALLBACK_PATCH' not in content:
+            # pycolmap import를 try-except로 감싸서 실패 시 None 처리
+            patched_content = content.replace(
+                'import pycolmap',
+                '''# COLMAP_FALLBACK_PATCH
+try:
+    import pycolmap
+except (ImportError, RuntimeError):
+    pycolmap = None
+    print("WARNING: pycolmap C++ backend unavailable, using COLMAP binary")'''
+            )
+            with open(patch_file, 'w') as f:
+                f.write(patched_content)
+            print("✓ Applied pycolmap fallback patch to hloc")
+    
+except Exception as e:
+    print(f"Patch attempt failed: {e}")
+EOF
+
+# 최종 상태 확인 및 PYTHONPATH 검증
+RUN python -c "try: import pycolmap; import pycolmap._core; print('✓ pycolmap C++ backend available')\nexcept: print('⚠ Using COLMAP binary fallback')" && \
+    which colmap && echo "✓ COLMAP binary ready" || echo "❌ No COLMAP found"
+
+# 🔧 로컬에서 미리 다운로드한 모델 복사 (네트워크 없이 빌드 가능)
+# 먼저 모델 디렉터리 생성
+RUN mkdir -p /home/user/.cache/torch/hub/checkpoints && \
+    mkdir -p /home/user/.cache/torch/hub/netvlad && \
+    mkdir -p /home/user/.cache/hloc
+
+# 로컬에서 미리 다운로드한 모델 파일들 복사 - 단계별 확인
+# 1. 전체 models_cache 디렉터리를 임시 위치로 복사
+COPY services/nerfstudio/models_cache/ /tmp/model_files/
+
+# 2. 복사된 파일들 확인 및 최종 위치로 이동
+RUN echo "=== Verifying copied model files ===" && \
+    echo "Contents of /tmp/model_files/:" && \
+    ls -la /tmp/model_files/ && \
+    echo "" && \
+    echo "=== Moving model files to final locations ===" && \
+    # .pth 파일들을 checkpoints로 이동
+    for file in /tmp/model_files/*.pth; do \
+        if [ -f "$file" ]; then \
+            filename=$(basename "$file") && \
+            echo "Moving $filename to checkpoints..." && \
+            cp "$file" "/home/user/.cache/torch/hub/checkpoints/$filename" && \
+            echo "✓ Moved $filename" ; \
+        fi \
+    done && \
+    # .mat 파일들을 netvlad로 이동
+    for file in /tmp/model_files/*.mat; do \
+        if [ -f "$file" ]; then \
+            filename=$(basename "$file") && \
+            echo "Moving $filename to netvlad..." && \
+            cp "$file" "/home/user/.cache/torch/hub/netvlad/$filename" && \
+            echo "✓ Moved $filename" ; \
+        fi \
+    done && \
+    # 임시 디렉터리 정리
+    rm -rf /tmp/model_files && \
+    echo "=== Model file copying completed ==="
+
+# 파일 권한 설정 및 최종 확인
+RUN chmod -R 755 /home/user/.cache && \
+    echo "=== Final verification of copied files ===" && \
+    echo "Checkpoints directory contents:" && \
+    ls -la /home/user/.cache/torch/hub/checkpoints/ && \
+    echo "" && \
+    echo "Expected LightGlue models:" && \
+    for model in superpoint_lightglue.pth disk_lightglue.pth aliked_lightglue.pth sift_lightglue.pth superpoint_v1.pth; do \
+        if [ -f "/home/user/.cache/torch/hub/checkpoints/$model" ]; then \
+            size=$(du -h "/home/user/.cache/torch/hub/checkpoints/$model" | cut -f1) && \
+            echo "  ✓ $model ($size)" ; \
+        else \
+            echo "  ✗ $model NOT FOUND!" ; \
+        fi \
+    done && \
+    echo "" && \
+    echo "NetVLAD directory contents:" && \
+    ls -la /home/user/.cache/torch/hub/netvlad/
+
+# 🔧 hloc 및 feature extractor 모델 확인 및 추가 설정
+RUN echo "=== Verifying pre-copied models ===" && \
+    python - <<'PY'
+import torch
+import os
+from pathlib import Path
+
+# 캐시 디렉터리 확인
+torch_cache = Path("/home/user/.cache/torch/hub/checkpoints")
+netvlad_dir = Path("/home/user/.cache/torch/hub/netvlad")
+hloc_cache = Path("/home/user/.cache/hloc")
+
+print("=== Checking pre-copied models ===")
+
+# 1. LightGlue 모델 확인
+print("\n✓ LightGlue models in torch hub cache:")
+if torch_cache.exists():
+    for f in sorted(torch_cache.glob("*.pth")):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  - {f.name}: {size_mb:.1f} MB")
+else:
+    print(f"  ERROR: Directory not found: {torch_cache}")
+
+# 2. NetVLAD 모델 확인  
+print("\n✓ NetVLAD models:")
+if netvlad_dir.exists():
+    for f in sorted(netvlad_dir.glob("*.mat")):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  - {f.name}: {size_mb:.1f} MB")
+else:
+    print(f"  ERROR: Directory not found: {netvlad_dir}")
+
+# 3. hloc extractor 설정 확인
+try:
+    import hloc.extractors
+    extractors = ["superpoint_aachen", "superpoint_max", "sift"]
+    print("\n✓ Available hloc extractors:")
+    for ext_name in extractors:
+        if ext_name in hloc.extractors.confs:
+            print(f"  - {ext_name}")
+except Exception as e:
+    print(f"⚠ hloc extractor check failed: {e}")
+
+print("\n✅ All pre-copied models verified")
+
+PY
+
+# 🔧 LightGlue 네트워크 다운로드 방지를 위한 강력한 패치
+RUN python - <<'EOF'
+import os
+import sys
+import shutil
+from pathlib import Path
+
+print("=== Applying LightGlue offline patch ===")
+
+try:
+    # 1. 먼저 LightGlue 패키지의 위치 확인
+    import lightglue
+    lightglue_path = Path(lightglue.__file__).parent
+    lightglue_file = lightglue_path / 'lightglue.py'
+    
+    print(f"LightGlue location: {lightglue_path}")
+    
+    # 2. 기존 파일 백업
+    backup_file = lightglue_path / 'lightglue.py.backup'
+    if not backup_file.exists():
+        shutil.copy(lightglue_file, backup_file)
+        print(f"✓ Backup created: {backup_file}")
+    
+    # 3. 파일 내용 읽기
+    with open(lightglue_file, 'r') as f:
+        content = f.read()
+    
+    # 4. torch.hub.load_state_dict_from_url을 오프라인 버전으로 완전히 교체
+    if 'LIGHTGLUE_OFFLINE_PATCH' not in content:
+        # 패치 코드 삽입 (파일 시작 부분에)
+        patch_code = '''# LIGHTGLUE_OFFLINE_PATCH
+import torch
+from pathlib import Path
+
+def _offline_load_state_dict_from_url(url, *args, **kwargs):
+    """Offline version that loads pre-downloaded models"""
+    # URL에서 모델 이름 추출
+    model_name = url.split('/')[-1]
+    
+    # torch.hub 기본 캐시 경로
+    cache_dir = Path("/home/user/.cache/torch/hub/checkpoints")
+    
+    # 실제 파일명과 정확히 매칭 (로컬에 저장된 파일명 그대로 사용)
+    possible_files = [
+        cache_dir / model_name,  # 원본 파일명 그대로
+    ]
+    
+    # LightGlue 모델 매핑 (URL의 파일명 -> 로컬 파일명)
+    if 'superpoint_lightglue.pth' in model_name:
+        possible_files.insert(0, cache_dir / "superpoint_lightglue.pth")
+    elif 'disk_lightglue.pth' in model_name:
+        possible_files.insert(0, cache_dir / "disk_lightglue.pth")
+    elif 'aliked_lightglue.pth' in model_name:
+        possible_files.insert(0, cache_dir / "aliked_lightglue.pth")
+    elif 'sift_lightglue.pth' in model_name:
+        possible_files.insert(0, cache_dir / "sift_lightglue.pth")
+    elif 'superpoint_v1.pth' in model_name:
+        possible_files.insert(0, cache_dir / "superpoint_v1.pth")
+    
+    # 파일 찾기 및 로드
+    for file_path in possible_files:
+        if file_path.exists():
+            print(f"Loading pre-downloaded model: {file_path}")
+            return torch.load(file_path, map_location=kwargs.get('map_location', 'cpu'))
+    
+    # 디버깅 정보
+    print(f"ERROR: Could not find pre-downloaded model for URL: {url}")
+    print(f"Model name extracted: {model_name}")
+    print(f"Searched locations: {[str(p) for p in possible_files]}")
+    print(f"Available files in cache:")
+    if cache_dir.exists():
+        for f in cache_dir.glob('*.pth'):
+            print(f"  - {f.name} ({f.stat().st_size / (1024*1024):.1f} MB)")
+    raise FileNotFoundError(f"Pre-downloaded model not found for: {model_name}")
+
+# torch.hub.load_state_dict_from_url을 오프라인 버전으로 교체
+original_torch_hub_load = torch.hub.load_state_dict_from_url
+torch.hub.load_state_dict_from_url = _offline_load_state_dict_from_url
+'''
+        
+        # 기존 import 문 뒤에 패치 코드 삽입
+        import_section_end = content.find('\nclass ')
+        if import_section_end > 0:
+            patched_content = content[:import_section_end] + '\n\n' + patch_code + '\n' + content[import_section_end:]
+        else:
+            patched_content = patch_code + '\n\n' + content
+        
+        # 파일 저장
+        with open(lightglue_file, 'w') as f:
+            f.write(patched_content)
+        
+        print("✓ LightGlue offline patch applied successfully")
+        print(f"  Patched file: {lightglue_file}")
+    else:
+        print("✓ LightGlue already patched")
+    
+    # 5. hloc의 lightglue matcher도 패치 - import 직전에 torch.hub 함수 교체 보장
+    try:
+        import hloc.matchers.lightglue as hloc_lg
+        hloc_lg_file = Path(hloc_lg.__file__)
+        
+        # hloc matcher 파일 수정 - lightglue import 전에 패치 적용
+        with open(hloc_lg_file, 'r') as f:
+            hloc_content = f.read()
+        
+        if 'HLOC_LIGHTGLUE_OFFLINE_PATCH' not in hloc_content:
+            # import lightglue 전에 패치 코드 삽입
+            patch_insert = '''# HLOC_LIGHTGLUE_OFFLINE_PATCH
+import torch
+from pathlib import Path
+
+# torch.hub 함수를 오프라인 버전으로 먼저 교체
+def _offline_load_state_dict_from_url(url, *args, **kwargs):
+    """Offline version that loads pre-downloaded models"""
+    model_name = url.split('/')[-1]
+    cache_dir = Path("/home/user/.cache/torch/hub/checkpoints")
+    
+    # 직접 파일명 매칭
+    if cache_dir.exists():
+        target_file = cache_dir / model_name
+        if target_file.exists():
+            print(f"[HLOC] Loading pre-downloaded model: {target_file}")
+            return torch.load(target_file, map_location=kwargs.get('map_location', 'cpu'))
+    
+    raise FileNotFoundError(f"[HLOC] Pre-downloaded model not found: {model_name}")
+
+torch.hub.load_state_dict_from_url = _offline_load_state_dict_from_url
+
+'''
+            # 파일 앞부분에 패치 삽입
+            hloc_patched = patch_insert + hloc_content
+            
+            with open(hloc_lg_file, 'w') as f:
+                f.write(hloc_patched)
+            
+            print("✓ hloc LightGlue matcher patched for offline mode")
+    except Exception as e:
+        print(f"⚠ hloc patch skipped: {e}")
+    
+except Exception as e:
+    print(f"ERROR: LightGlue patch failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+print("✅ LightGlue offline patch completed")
+EOF
+
+# 🔧 pycolmap 호환성 패치 - PosixPath 문제 해결
+RUN python - <<'EOF'
+import os
+import sys
+from pathlib import Path
+
+print("=== Applying pycolmap compatibility patch ===")
+
+try:
+    # hloc reconstruction.py 파일 패치
+    import hloc.reconstruction as hloc_recon
+    recon_file = Path(hloc_recon.__file__)
+    
+    print(f"Patching file: {recon_file}")
+    
+    # 파일 내용 읽기
+    with open(recon_file, 'r') as f:
+        content = f.read()
+    
+    if 'PYCOLMAP_COMPATIBILITY_PATCH' not in content:
+        # pycolmap.import_images 호출 부분을 찾아서 Path 객체를 str로 변환
+        patch_applied = False
+        
+        # import_images 함수 호출 패턴 찾기
+        import re
+        
+        # pycolmap.import_images 호출 부분 패치
+        pattern = r'(\s+)pycolmap\.import_images\(\s*database,\s*image_dir,\s*camera_mode'
+        replacement = r'\1# PYCOLMAP_COMPATIBILITY_PATCH: Convert Path objects to strings\n\1pycolmap.import_images(str(database), str(image_dir), camera_mode'
+        
+        patched_content = re.sub(pattern, replacement, content)
+        
+        if patched_content != content:
+            patch_applied = True
+            content = patched_content
+            print("✓ Applied Path-to-string conversion patch")
+        
+        # 다른 패턴도 확인 (kwargs 사용하는 경우)
+        if 'image_names=' in content and 'options=' in content:
+            # kwargs 버전도 패치
+            pattern2 = r'(\s+)pycolmap\.import_images\(\s*([^,]+),\s*([^,]+),\s*([^;]+);\s*kwargs:'
+            if 'kwargs:' in content:
+                # kwargs 패턴이 있다면 더 정교한 패치 필요
+                lines = content.split('\n')
+                for i, line in enumerate(lines):
+                    if 'pycolmap.import_images(' in line and 'kwargs:' in content[content.find(line):content.find(line)+200]:
+                        # 해당 라인과 그 다음 몇 라인을 찾아서 수정
+                        if 'database' in line and 'image_dir' in line:
+                            lines[i] = line.replace('database,', 'str(database),').replace('image_dir,', 'str(image_dir),')
+                            patch_applied = True
+                            print("✓ Applied kwargs version patch")
+                            break
+                content = '\n'.join(lines)
+        
+        # 더 간단한 접근: import_images 호출을 감싸는 wrapper 함수 생성
+        if not patch_applied:
+            # 기존 import pycolmap 라인을 찾아서 그 다음에 패치 추가
+            import_line_index = -1
+            lines = content.split('\n')
+            
+            for i, line in enumerate(lines):
+                if 'import pycolmap' in line and not line.strip().startswith('#'):
+                    import_line_index = i
+                    break
+            
+            if import_line_index >= 0:
+# import pycolmap 라인 다음에 패치 코드 삽입
+                wrapper_patch_lines = [
+                    '',
+                    '# PYCOLMAP_COMPATIBILITY_PATCH',
+                    '# Backup original function FIRST',
+                    '_original_import_images = pycolmap.import_images',
+                    '',
+                    'def _patched_import_images(database_path, image_path, camera_mode, image_list=None, options=None, **kwargs):',
+                    '    """Wrapper for pycolmap.import_images that converts Path objects to strings"""',
+                    '    # Convert Path objects to strings', 
+                    '    database_str = str(database_path) if hasattr(database_path, "__fspath__") else database_path',
+                    '    image_str = str(image_path) if hasattr(image_path, "__fspath__") else image_path',
+                    '    ',
+                    '    # Handle kwargs mapping for API compatibility',
+                    '    if "image_names" in kwargs:',
+                    '        image_list = kwargs.pop("image_names", [])',
+                    '    if "options" in kwargs:',
+                    '        options = kwargs.pop("options", None)',
+                    '    ',
+                    '    # Create default options if not provided',
+                    '    if options is None:',
+                    '        import pycolmap',
+                    '        options = pycolmap.ImageReaderOptions()',
+                    '    ',
+                    '    # Ensure image_list is provided (empty list if None)',
+                    '    if image_list is None:',
+                    '        image_list = []',
+                    '    ',
+                    '    # Call with proper positional arguments',
+                    '    return _original_import_images(database_str, image_str, camera_mode, image_list, options)',
+                    '',
+                    '# Replace with patched version',
+                    'pycolmap.import_images = _patched_import_images',
+                    ''
+                ]
+                
+                # import 라인 다음에 패치 코드 삽입
+                lines[import_line_index+1:import_line_index+1] = wrapper_patch_lines
+                content = '\n'.join(lines)
+                patch_applied = True
+                print("✓ Applied wrapper function patch after import statement")
+            else:
+                print("⚠ Could not find 'import pycolmap' line for patching")
+        
+        if patch_applied:
+            # 패치된 내용을 파일에 저장
+            with open(recon_file, 'w') as f:
+                f.write(content)
+            print(f"✓ pycolmap compatibility patch applied to {recon_file}")
+        else:
+            print("⚠ No suitable pattern found for patching")
+    else:
+        print("✓ pycolmap compatibility patch already applied")
+
+except Exception as e:
+    print(f"ERROR: pycolmap compatibility patch failed: {e}")
+    import traceback
+    traceback.print_exc()
+
+print("✅ pycolmap compatibility patch completed")
+EOF
+
+# SuperGluePretrainedNetwork 및 전체 모듈 검증
+RUN echo "=== Final module verification ===" && \
+    ls -al /opt/third_party | grep SuperGluePretrainedNetwork && \
+    export PYTHONPATH=/opt/third_party:$PYTHONPATH && \
+    python - <<'PY'
+import importlib.util as I, sys
+print("PYTHON:", sys.executable)
+print("PYTHONPATH:", sys.path[:3])
+print("hloc:", bool(I.find_spec("hloc")))
+print("lightglue:", bool(I.find_spec("lightglue")))
+print("SuperGluePretrainedNetwork:", bool(I.find_spec("SuperGluePretrainedNetwork")))
+try:
+    from SuperGluePretrainedNetwork.models import superpoint
+    print("✓ SuperGluePretrainedNetwork.models.superpoint import successful")
+except Exception as e:
+    print("⚠ SuperGluePretrainedNetwork import failed:", e)
+
+# ns-process-data 호환성 최종 확인
+try:
+    import nerfstudio
+    print("✓ nerfstudio available")
+    print("✓ All dependencies ready for ns-process-data")
+except Exception as e:
+    print("⚠ nerfstudio issue:", e)
+
+# 최종 검증: 모델이 올바른 위치에 있는지 확인
+print("\n=== Final Model Location Verification ===")
+from pathlib import Path
+cache_dir = Path("/home/user/.cache/torch/hub/checkpoints")
+required_models = [
+    "superpoint_lightglue.pth",
+    "disk_lightglue.pth", 
+    "aliked_lightglue.pth",
+    "sift_lightglue.pth",
+    "superpoint_v1.pth"
+]
+
+if cache_dir.exists():
+    print(f"Torch hub cache: {cache_dir}")
+    models = list(cache_dir.glob("*.pth"))
+    print(f"Found {len(models)} model files:")
+    for m in sorted(models):
+        size_mb = m.stat().st_size / (1024 * 1024)
+        status = "✓" if m.name in required_models else "?"
+        print(f"  {status} {m.name}: {size_mb:.1f} MB")
+    
+    # 필수 모델 확인
+    missing = []
+    for req_model in required_models:
+        if not (cache_dir / req_model).exists():
+            missing.append(req_model)
+    
+    if missing:
+        print(f"\n⚠ WARNING: Missing required models: {missing}")
+    else:
+        print("\n✓ All required models are present")
+else:
+    print(f"ERROR: Cache directory not found: {cache_dir}")
+
+# LightGlue 패치 확인
+try:
+    import lightglue
+    lg_file = Path(lightglue.__file__).parent / 'lightglue.py'
+    with open(lg_file, 'r') as f:
+        content = f.read()
+    if 'LIGHTGLUE_OFFLINE_PATCH' in content:
+        print("✓ LightGlue offline patch is active")
+    else:
+        print("⚠ LightGlue offline patch NOT found")
+        
+    # hloc 패치 확인
+    import hloc.matchers.lightglue as hloc_lg
+    hloc_file = Path(hloc_lg.__file__)
+    with open(hloc_file, 'r') as f:
+        hloc_content = f.read()
+    if 'HLOC_LIGHTGLUE_OFFLINE_PATCH' in hloc_content:
+        print("✓ HLOC LightGlue matcher offline patch is active")
+    else:
+        print("⚠ HLOC patch NOT found")
+        
+except Exception as e:
+    print(f"⚠ Could not verify patches: {e}")
+PY
+
+# 🔧 DataLoader shared memory 오류 해결을 위한 환경변수 설정
+ENV OMP_NUM_THREADS=1
+ENV PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512"
+# DataLoader workers 제한 (shared memory 부족 방지)
+ENV TORCH_NUM_WORKERS=0
+
+WORKDIR /workspace
