@@ -168,6 +168,10 @@ RUN python -m pip install --break-system-packages "numpy==1.26.4" --force-reinst
 # 최종 정리
 RUN rm -rf /tmp/scripts /tmp/patches
 
+# ns-export 오류 수정: eval_utils.py의 torch.load에 weights_only=False 추가
+RUN sed -i 's/loaded_state = torch.load(load_path, map_location="cpu")/loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)/g' \
+    /usr/local/lib/python3.10/dist-packages/nerfstudio/utils/eval_utils.py
+
 # 작업 디렉터리 설정
 WORKDIR /workspace
 

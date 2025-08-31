@@ -17,6 +17,10 @@ services:
       - ./data:/workspace/data:rw
       - ./outputs:/workspace/outputs:rw
       - ./models:/workspace/models:rw
+      - ./exports:/workspace/exports:rw
+      - ./renders:/workspace/renders:rw
+      - ./evals:/workspace/evals:rw
+      - ./viewers:/workspace/viewers:rw
     ports:
       - "7007:7007"
     stdin_open: true
